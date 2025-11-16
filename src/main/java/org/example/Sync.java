@@ -9,6 +9,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -33,8 +37,12 @@ public class Sync {
         String sourceFolderPath = "D:\\xena\\iCloud Photos\\Photos";
         String targetFolderPath = "G:\\xena\\downloaded-photos";
         boolean isErrorFiles = true;
-        syncErrorFiles(sourceFolderPath, targetFolderPath);
-        Set<String> fileNames = isErrorFiles ? readErrorFiles() : listFilesUsingFilesList(sourceFolderPath);
+        
+        // To sync files from a specific date to now, use listFilesByDate() instead of listFilesUsingFilesList()
+        LocalDate fromDate = LocalDate.of(2025, 10, 31); // Oct 31, 2025
+        Set<String> fileNames = listFilesByDate(sourceFolderPath, fromDate);
+        
+        // Set<String> fileNames = isErrorFiles ? readErrorFiles() : listFilesUsingFilesList(sourceFolderPath);
 
         // Sync all files in parallel
         syncAllFiles(fileNames, sourceFolderPath, targetFolderPath);
@@ -449,6 +457,37 @@ public class Sync {
                     .collect(Collectors.toSet());
         }
     }
+
+    /**
+     * Lists files in a directory that were modified on or after a specific date.
+     *
+     * @param dir Directory path to list files from
+     * @param fromDate The date from which to include files (inclusive)
+     * @return Set of file names that were modified on or after the specified date
+     * @throws IOException if file listing fails
+     */
+    public static Set<String> listFilesByDate(String dir, LocalDate fromDate) throws IOException {
+        Instant fromInstant = fromDate.atStartOfDay(ZoneId.systemDefault()).toInstant();
+        
+        try (Stream<Path> stream = Files.list(Paths.get(dir))) {
+            return stream
+                    .filter(file -> !Files.isDirectory(file))
+                    .filter(file -> {
+                        try {
+                            FileTime lastModifiedTime = Files.getLastModifiedTime(file);
+                            Instant fileInstant = lastModifiedTime.toInstant();
+                            return !fileInstant.isBefore(fromInstant);
+                        } catch (IOException e) {
+                            System.out.println("Error reading modification time for " + file + ": " + e.getMessage());
+                            return false;
+                        }
+                    })
+                    .map(Path::getFileName)
+                    .map(Path::toString)
+                    .collect(Collectors.toSet());
+        }
+    }
+
 
     public static String getChecksum(Path filePath) {
         try (InputStream is = Files.newInputStream(filePath)) {
