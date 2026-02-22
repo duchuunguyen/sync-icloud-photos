@@ -39,10 +39,10 @@ public class Sync {
         boolean isErrorFiles = true;
         
         // To sync files from a specific date to now, use listFilesByDate() instead of listFilesUsingFilesList()
-        LocalDate fromDate = LocalDate.of(2025, 10, 31); // Oct 31, 2025
+        LocalDate fromDate = LocalDate.of(2025, 10, 15); // Nov 15, 2025
         Set<String> fileNames = listFilesByDate(sourceFolderPath, fromDate);
         
-        // Set<String> fileNames = isErrorFiles ? readErrorFiles() : listFilesUsingFilesList(sourceFolderPath);
+        //  Set<String> fileNames = isErrorFiles ? readErrorFiles() : listFilesUsingFilesList(sourceFolderPath);
 
         // Sync all files in parallel
         syncAllFiles(fileNames, sourceFolderPath, targetFolderPath);
@@ -58,8 +58,8 @@ public class Sync {
             writeErrorFilesToFile(errorFiles);
             System.out.println("\nError files have been written to: " + Paths.get(System.getProperty("user.dir"), ERROR_FILES_FILENAME));
             System.out.println("You can use handleErrorFilesFromFile() later to process them.");
+            handleErrorFilesFromFile(targetFolderPath);
         }
-        handleErrorFilesFromFile(targetFolderPath);
     }
 
     public static Set<String> readErrorFiles() throws IOException {
