@@ -99,9 +99,79 @@ fn process_parents() -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// An icloudpd download this app does not own, e.g. left behind by a crash.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Stray {
+    /// Process group id. Signaling `-group` reaches the launcher and the downloader it started.
+    pub group: u32,
+    pub command: String,
+}
+
+/// icloudpd downloads outside the `owned` process groups, optionally only those writing into `directory`.
+pub fn find_icloudpd(owned: &[u32], directory: Option<&str>) -> Vec<Stray> {
+    let Ok(output) = std::process::Command::new("ps").args(["-axo", "pid=,pgid=,command="]).output() else {
+        return Vec::new();
+    };
+    parse_icloudpd(&String::from_utf8_lossy(&output.stdout), owned, directory)
+}
+
+fn parse_icloudpd(ps: &str, owned: &[u32], directory: Option<&str>) -> Vec<Stray> {
+    let mut out: Vec<Stray> = Vec::new();
+    for line in ps.lines() {
+        let Some((pid, rest)) = line.trim_start().split_once(' ') else {
+            continue;
+        };
+        let Some((group, command)) = rest.trim_start().split_once(' ') else {
+            continue;
+        };
+        let (Ok(pid), Ok(group)) = (pid.parse::<u32>(), group.trim().parse::<u32>()) else {
+            continue;
+        };
+        let command = command.trim();
+        if !command.contains("icloudpd") || !command.contains("--directory") || owned.contains(&group) || owned.contains(&pid) {
+            continue;
+        }
+        if let Some(dir) = directory {
+            let needle = format!("--directory {dir}");
+            let hit = command.find(&needle).is_some_and(|at| matches!(command[at + needle.len()..].chars().next(), None | Some(' ')));
+            if !hit {
+                continue;
+            }
+        }
+        if !out.iter().any(|stray| stray.group == group) {
+            out.push(Stray { group, command: command.to_string() });
+        }
+    }
+    out
+}
+
+/// Ask a stray group to stop, wait up to `wait`, then kill whatever is left.
+pub fn terminate(group: u32, wait: std::time::Duration) {
+    if group == 0 {
+        return;
+    }
+    signal_interrupt(group);
+    let start = std::time::Instant::now();
+    while group_alive(group) && start.elapsed() < wait {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if group_alive(group) {
+        let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{group}")]).stderr(std::process::Stdio::null()).status();
+    }
+}
+
+fn group_alive(group: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", "--", &format!("-{group}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_command_in, signal_interrupt};
+    use super::{find_icloudpd, parse_icloudpd, resolve_command_in, signal_interrupt, terminate};
     use std::fs;
     use std::path::PathBuf;
 
@@ -165,5 +235,28 @@ mod tests {
 
     fn pid_alive(pid: u32) -> bool {
         Command::new("ps").args(["-p", &pid.to_string()]).output().map(|output| output.status.success()).unwrap_or(false)
+    }
+
+    #[test]
+    fn ps_rows_are_filtered_by_owner_and_directory() {
+        let ps = "  10  10 /usr/bin/python /x/icloudpd --directory /a/photos --username me\n  11  10 /usr/bin/python /x/icloudpd --directory /a/photos --username me\n  20  20 icloudpd --directory /a/photos-old --username me\n  30  30 pip install icloudpd\n";
+        assert_eq!(parse_icloudpd(ps, &[], Some("/a/photos")).len(), 1);
+        assert_eq!(parse_icloudpd(ps, &[], None).len(), 2);
+        assert_eq!(parse_icloudpd(ps, &[10], None).len(), 1);
+    }
+
+    #[test]
+    fn a_stray_download_is_found_and_terminated() {
+        let dir = format!("/tmp/stray-{}", std::process::id());
+        let mut command = Command::new("sh");
+        // Trailing `true` keeps sh from exec-ing sleep, so the arguments stay visible in ps.
+        command.args(["-c", "sleep 60; true", "icloudpd", "--directory", &dir, "--username", "me"]);
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn().unwrap();
+        let found = find_icloudpd(&[], Some(&dir));
+        assert_eq!(found.len(), 1, "{found:?}");
+        terminate(found[0].group, Duration::from_secs(5));
+        assert!(wait_until(Duration::from_secs(5), || child.try_wait().unwrap().is_some()));
+        assert!(find_icloudpd(&[], Some(&dir)).is_empty());
     }
 }

@@ -8,7 +8,12 @@ use serde::Serialize;
 static IDS: AtomicU64 = AtomicU64::new(1);
 
 fn new_id() -> String {
-    format!("{:x}-{}", IDS.fetch_add(1, Ordering::Relaxed), std::process::id())
+    // Millisecond clock first, so an ID is never reused after a restart or after a sync is deleted.
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    format!("{:x}-{:x}", millis, IDS.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +86,9 @@ impl Store {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
+        // WAL + NORMAL: a per-file state update no longer costs an fsync. A crash can lose the last
+        // updates, and recover_interrupted / the next scan redo that work.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -119,6 +127,7 @@ impl Store {
                 keep_path TEXT,
                 remove_path TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS files_by_state ON files (job_id, state, rel_path);
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -188,6 +197,16 @@ impl Store {
         Ok(())
     }
 
+    /// Forget a job and its bookkeeping rows. Photo files on disk are never touched.
+    pub fn delete_job(&self, id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("db");
+        for table in ["files", "review_items", "recorded"] {
+            conn.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
+        }
+        conn.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     pub fn set_stage(&self, id: &str, stage: &str) -> rusqlite::Result<()> {
         self.conn.lock().expect("db").execute("UPDATE jobs SET stage = ?1 WHERE id = ?2", params![stage, id])?;
         Ok(())
@@ -205,25 +224,27 @@ impl Store {
 
     pub fn replace_snapshot(&self, id: &str, rels: &[String]) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("db");
-        conn.execute("DELETE FROM files WHERE job_id = ?1", [id])?;
-        for rel in rels {
-            conn.execute(
-                "INSERT INTO files (job_id, rel_path, state, attempts) VALUES (?1, ?2, 'pending', 0)",
-                params![id, rel],
-            )?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM files WHERE job_id = ?1", [id])?;
+        {
+            let mut insert = tx.prepare_cached("INSERT INTO files (job_id, rel_path, state, attempts) VALUES (?1, ?2, 'pending', 0)")?;
+            for rel in rels {
+                insert.execute(params![id, rel])?;
+            }
         }
-        Ok(())
+        tx.commit()
     }
 
     pub fn add_missing_files(&self, id: &str, rels: &[String]) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("db");
-        for rel in rels {
-            conn.execute(
-                "INSERT OR IGNORE INTO files (job_id, rel_path, state, attempts) VALUES (?1, ?2, 'pending', 0)",
-                params![id, rel],
-            )?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut insert = tx.prepare_cached("INSERT OR IGNORE INTO files (job_id, rel_path, state, attempts) VALUES (?1, ?2, 'pending', 0)")?;
+            for rel in rels {
+                insert.execute(params![id, rel])?;
+            }
         }
-        Ok(())
+        tx.commit()
     }
 
     pub fn has_open_work(&self, id: &str, sort: bool) -> rusqlite::Result<bool> {
@@ -234,6 +255,14 @@ impl Store {
         };
         let count: u32 = self.conn.lock().expect("db").query_row(sql, [id], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    /// A live job runs for days, so a file that used up its attempts (disk unplugged, locked file) is tried again.
+    pub fn retry_failed(&self, id: &str) -> rusqlite::Result<usize> {
+        self.conn.lock().expect("db").execute(
+            "UPDATE files SET state = 'pending', attempts = 0, error = NULL WHERE job_id = ?1 AND state = 'failed'",
+            [id],
+        )
     }
 
     pub fn file_count(&self, id: &str) -> rusqlite::Result<u32> {
@@ -326,6 +355,30 @@ impl Store {
             "INSERT INTO recorded (dest_root, rel_path, job_id) VALUES (?1, ?2, ?3)
              ON CONFLICT(dest_root, rel_path) DO UPDATE SET job_id = excluded.job_id",
             params![dest_root, rel_path, job_id],
+        )?;
+        Ok(())
+    }
+
+    /// (rel_path, dest_rel) of files the database believes are in the archive.
+    pub fn filed(&self, id: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db");
+        let mut stmt = conn.prepare(
+            "SELECT rel_path, COALESCE(dest_rel, rel_path) FROM files WHERE job_id = ?1 AND state IN ('verified', 'arranged')",
+        )?;
+        let rows = stmt.query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    pub fn drop_file(&self, id: &str, rel: &str) -> rusqlite::Result<()> {
+        self.conn.lock().expect("db").execute("DELETE FROM files WHERE job_id = ?1 AND rel_path = ?2", params![id, rel])?;
+        Ok(())
+    }
+
+    /// Put a file back in the queue so it is copied again.
+    pub fn requeue(&self, id: &str, rel: &str) -> rusqlite::Result<()> {
+        self.conn.lock().expect("db").execute(
+            "UPDATE files SET state = 'pending', attempts = 0, error = NULL, dest_rel = NULL WHERE job_id = ?1 AND rel_path = ?2",
+            params![id, rel],
         )?;
         Ok(())
     }
@@ -426,6 +479,10 @@ impl Store {
 
     pub fn start_at_login(&self) -> bool {
         self.setting("login").ok().flatten().map(|value| value != "false").unwrap_or(true)
+    }
+
+    pub fn restart_on_crash(&self) -> bool {
+        self.setting("restart_on_crash").ok().flatten().map(|value| value != "false").unwrap_or(true)
     }
 
     pub fn icloudpd_command(&self) -> String {

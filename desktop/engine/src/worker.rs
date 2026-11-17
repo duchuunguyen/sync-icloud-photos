@@ -324,7 +324,9 @@ fn copy_claimed(store: &Store, job: &crate::store::JobRecord, file: &FileRow, fl
             flag.finished.fetch_add(1, Ordering::Relaxed);
         }
         Ok(CopyAction::Copied) => {
-            store.set_file(&job.id, &file.rel_path, "copied", file.attempts, None, Some(&file.rel_path))?;
+            // copy_reporting already matched the MD5 of source and copy before renaming; hashing both again adds nothing.
+            store.set_file(&job.id, &file.rel_path, "verified", file.attempts, None, Some(&file.rel_path))?;
+            store.record(&job.dest, &file.rel_path, &job.id)?;
             flag.finished.fetch_add(1, Ordering::Relaxed);
         }
         Err(CopyError::Aborted) => {
@@ -332,6 +334,10 @@ fn copy_claimed(store: &Store, job: &crate::store::JobRecord, file: &FileRow, fl
         }
         Err(CopyError::HashMismatch) => {
             fail_attempt(store, job, &file, "checksum did not match after copy", "copy_failed")?;
+        }
+        Err(CopyError::Io(_)) if !src.is_file() => {
+            // The download disappeared (icloudpd renamed or removed it), so there is nothing left to copy.
+            store.drop_file(&job.id, &file.rel_path)?;
         }
         Err(CopyError::Io(err)) => {
             fail_attempt(store, job, &file, &err.to_string(), "copy_failed")?;
@@ -397,6 +403,12 @@ fn arrange_one(store: &Store, job: &crate::store::JobRecord) -> rusqlite::Result
             }
             store.record(&job.dest, &rel, &job.id)?;
             store.set_file(&job.id, &file.rel_path, "arranged", file.attempts, None, Some(&rel))?;
+            // The copy landed in YYYY/MM/DD first; drop those folders once empty (remove_dir refuses a non-empty one).
+            for dir in src.ancestors().skip(1).take_while(|dir| *dir != Path::new(&job.dest)) {
+                if fs::remove_dir(dir).is_err() {
+                    break;
+                }
+            }
         }
         Err(err) => {
             store.set_file(&job.id, &file.rel_path, "failed", MAX_ATTEMPTS, Some(&err.to_string()), Some(&dest_rel))?;
@@ -455,9 +467,16 @@ fn enter_mirror_review(store: &Store, job: &crate::store::JobRecord) -> rusqlite
     Ok(())
 }
 
+const RETRY_FAILED_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
 fn run_live(store: &Store, job_id: &str, flag: &Flag) -> rusqlite::Result<()> {
     store.set_stage(job_id, "sync")?;
     let mut last_scan = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    let mut last_retry = std::time::Instant::now();
+    let mut scan_every = std::time::Duration::from_secs(1);
+    if let Some(job) = store.get_job(job_id)? {
+        reconcile(store, &job)?;
+    }
     loop {
         let Some(job) = store.get_job(job_id)? else {
             return Ok(());
@@ -470,9 +489,17 @@ fn run_live(store: &Store, job_id: &str, flag: &Flag) -> rusqlite::Result<()> {
             store.set_current(job_id, None)?;
             return Ok(());
         }
-        if last_scan.elapsed() >= std::time::Duration::from_secs(1) {
+        if last_scan.elapsed() >= scan_every {
+            let started = std::time::Instant::now();
             ingest(store, &job)?;
             last_scan = std::time::Instant::now();
+            // A 100k-file tree takes seconds to walk: wait ten times as long as the last scan took.
+            scan_every = scan_every.max(started.elapsed() * 10);
+        }
+        if last_retry.elapsed() >= RETRY_FAILED_EVERY {
+            store.retry_failed(job_id)?;
+            reconcile(store, &job)?;
+            last_retry = std::time::Instant::now();
         }
         let copied = copy_batch(store, &job, flag)?;
         let verified = verify_batch(store, &job)?;
@@ -494,6 +521,26 @@ fn run_live(store: &Store, job_id: &str, flag: &Flag) -> rusqlite::Result<()> {
     }
 }
 
+/// The database says a file is filed, but someone may have moved or deleted it since. A stat per file is cheap,
+/// so check the disk and queue anything gone to be copied again from the download folder.
+fn reconcile(store: &Store, job: &crate::store::JobRecord) -> rusqlite::Result<usize> {
+    let mut requeued = 0;
+    for (rel, dest_rel) in store.filed(&job.id)? {
+        let present = safe_join(Path::new(&job.dest), &dest_rel).is_ok_and(|path| path.is_file());
+        if !present {
+            store.forget(&job.dest, &dest_rel)?;
+            // Source gone too (icloudpd renamed or removed it): nothing to copy, so forget the row.
+            if safe_join(Path::new(&job.source), &rel).is_ok_and(|path| path.is_file()) {
+                store.requeue(&job.id, &rel)?;
+                requeued += 1;
+            } else {
+                store.drop_file(&job.id, &rel)?;
+            }
+        }
+    }
+    Ok(requeued)
+}
+
 fn ingest(store: &Store, job: &crate::store::JobRecord) -> rusqlite::Result<()> {
     let opts = ScanOptions {
         recursive: true,
@@ -502,7 +549,10 @@ fn ingest(store: &Store, job: &crate::store::JobRecord) -> rusqlite::Result<()> 
         skip_icloudpd: true,
     };
     match scan(Path::new(&job.source), &opts) {
-        Ok(rels) => store.add_missing_files(&job.id, &rels),
+        Ok(rels) => {
+            store.add_missing_files(&job.id, &rels)?;
+            store.set_error(&job.id, None)
+        }
         Err(err) => {
             store.set_error(&job.id, Some(&err.to_string()))?;
             Ok(())
@@ -568,13 +618,19 @@ fn fail_attempt(store: &Store, job: &crate::store::JobRecord, file: &FileRow, me
     Ok(())
 }
 
+/// MD5 of every media file that shares a folder and normalized name with another file.
+/// A file with a unique name cannot be a duplicate, so it is never read.
 fn media_with_md5(root: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    walk_media(root, root, &mut out);
-    out
+    let mut by_name: HashMap<(String, String), Vec<String>> = HashMap::new();
+    walk_media(root, root, &mut by_name);
+    let candidates: Vec<String> = by_name.into_values().filter(|group| group.len() > 1).flatten().collect();
+    candidates
+        .into_iter()
+        .filter_map(|rel| md5_file(&root.join(&rel)).ok().map(|md5| (rel, md5)))
+        .collect()
 }
 
-fn walk_media(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+fn walk_media(root: &Path, dir: &Path, out: &mut HashMap<(String, String), Vec<String>>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -587,9 +643,6 @@ fn walk_media(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
         if !is_media(&path) {
             continue;
         }
-        let Ok(md5) = md5_file(&path) else {
-            continue;
-        };
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -597,7 +650,9 @@ fn walk_media(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        out.push((rel, md5));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let folder = rel.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+        out.entry((folder, crate::names::normalize_file_name(&name))).or_default().push(rel);
     }
 }
 
@@ -841,6 +896,18 @@ mod tests {
         let errors = store.errors(&id).unwrap();
         assert_eq!(errors[0].attempts, 3);
         assert_eq!(store.get_job(&id).unwrap().unwrap().state, "completed_with_errors");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retry_failed_puts_exhausted_files_back_to_pending() {
+        let store = Store::open_in_memory().unwrap();
+        let root = scratch("retry");
+        let id = store.create_job(job(&root, &root, false, false, false)).unwrap();
+        store.replace_snapshot(&id, &["a.jpg".into()]).unwrap();
+        store.set_file(&id, "a.jpg", "failed", 3, Some("disk gone"), None).unwrap();
+        assert_eq!(store.retry_failed(&id).unwrap(), 1);
+        assert!(store.errors(&id).unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 

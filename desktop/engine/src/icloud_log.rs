@@ -14,6 +14,9 @@ pub struct IcloudProgress {
     pub pass_complete: bool,
     pub failed: bool,
     pub needs_mfa: bool,
+    pub waiting_since_ms: Option<u64>,
+    /// Last lines icloudpd printed, newest last.
+    log: Vec<String>,
     first_ms: Option<u64>,
     saw_complete: bool,
     saw_error_this_pass: bool,
@@ -33,6 +36,8 @@ impl Default for IcloudProgress {
             pass_complete: false,
             failed: false,
             needs_mfa: false,
+            waiting_since_ms: None,
+            log: Vec::new(),
             first_ms: None,
             saw_complete: false,
             saw_error_this_pass: false,
@@ -52,6 +57,8 @@ pub struct IcloudStatus {
     pub message: String,
     pub needs_mfa: bool,
     pub failed: bool,
+    pub waiting_since_ms: Option<u64>,
+    pub log: Vec<String>,
 }
 
 impl IcloudProgress {
@@ -67,6 +74,8 @@ impl IcloudProgress {
             message: self.message.clone(),
             needs_mfa: self.needs_mfa,
             failed: self.failed,
+            waiting_since_ms: self.waiting_since_ms,
+            log: self.log.clone(),
         }
     }
 
@@ -74,6 +83,8 @@ impl IcloudProgress {
         self.pass_complete = false;
     }
 }
+
+const LOG_LINES: usize = 100;
 
 /// Arguments for one watch-mode run. `--auto-delete` is never included.
 pub fn command_args(directory: &str, apple_id: &str, watch_secs: u32) -> Vec<String> {
@@ -96,6 +107,12 @@ pub fn command_args(directory: &str, apple_id: &str, watch_secs: u32) -> Vec<Str
 }
 
 pub fn note_line(progress: &mut IcloudProgress, line: &str, now_ms: u64) {
+    if !line.trim().is_empty() {
+        if progress.log.len() >= LOG_LINES {
+            progress.log.remove(0);
+        }
+        progress.log.push(line.trim().to_string());
+    }
     let (level, message) = split_log(line);
     if level == "ERROR" {
         progress.saw_error_this_pass = true;
@@ -150,7 +167,10 @@ pub fn note_line(progress: &mut IcloudProgress, line: &str, now_ms: u64) {
     }
     if message.contains("Waiting") && message.contains("sec") {
         progress.phase = "waiting".into();
-        progress.message = message.to_string();
+        progress.waiting_since_ms = Some(now_ms);
+        if !progress.failed {
+            progress.message = message.to_string();
+        }
         if progress.saw_complete && !progress.saw_error_this_pass {
             progress.pass_complete = true;
             progress.failed = false;

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sync_icloud_engine::{
-    command_args, recover_interrupted, resolve_command, resolve_review, run_job, signal_interrupt, FileError, Flag, IcloudStatus,
+    check_backup, command_args, find_icloudpd, terminate, Stray, recover_interrupted, resolve_command, resolve_review, run_job, signal_interrupt, FileError, Flag, IcloudStatus,
     JobRecord, NewJob,
     ReviewItem, Store,
 };
@@ -20,12 +20,24 @@ use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
 static PICKING_FOLDER: AtomicBool = AtomicBool::new(false);
+// Held for the life of the process; a second copy of the app would start a second icloudpd.
+static INSTANCE_LOCK: std::sync::OnceLock<fs::File> = std::sync::OnceLock::new();
 
 struct AppState {
     store: Arc<Store>,
     flags: Mutex<HashMap<String, Arc<Flag>>>,
     gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pids: Mutex<HashMap<String, u32>>,
+    recovery: Mutex<Option<Recovery>>,
+}
+
+/// Shown after the previous run ended without Quit: what the catch-up found.
+#[derive(Clone, Serialize)]
+struct Recovery {
+    /// "catching_up", "ok" or "problem"
+    phase: String,
+    missing: usize,
+    wrong_folder: usize,
 }
 
 struct IcloudChild {
@@ -40,6 +52,7 @@ struct JobListItem {
     done: u32,
     total: u32,
     arranged: u32,
+    failed: usize,
     icloud_status: Option<IcloudStatus>,
 }
 
@@ -59,6 +72,7 @@ struct JobView {
 #[derive(Serialize)]
 struct SettingsView {
     login: bool,
+    restart_on_crash: bool,
     workers: u32,
     icloudpd: String,
 }
@@ -66,6 +80,11 @@ struct SettingsView {
 fn db_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join("Library/Application Support/Sync iCloud Photos/jobs.db")
+}
+
+/// icloudpd output for one sync, kept across restarts and removed with the sync.
+fn log_path(id: &str) -> PathBuf {
+    db_path().with_file_name("logs").join(format!("{id}.log"))
 }
 
 fn launch_agent_path() -> PathBuf {
@@ -77,7 +96,7 @@ fn xml_escape(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn apply_login(enabled: bool) {
+fn apply_login(enabled: bool, restart_on_crash: bool) {
     let path = launch_agent_path();
     if !enabled {
         let _ = fs::remove_file(&path);
@@ -101,11 +120,13 @@ fn apply_login(enabled: bool) {
     <string>{}</string>
   </array>
   <key>RunAtLoad</key>
-  <true/>
+  <true/>{}
 </dict>
 </plist>
 "#,
-        xml_escape(&exe.display().to_string())
+        xml_escape(&exe.display().to_string()),
+        // Relaunch only after a crash. Quit exits with 0, so it stays quit.
+        if restart_on_crash { "\n  <key>KeepAlive</key>\n  <dict><key>SuccessfulExit</key><false/></dict>" } else { "" }
     );
     let _ = fs::write(&path, body);
 }
@@ -152,7 +173,20 @@ fn spawn(app: Arc<AppState>, id: String) {
     });
 }
 
+fn owned_groups(app: &AppState) -> Vec<u32> {
+    app.pids.lock().map(|pids| pids.values().copied().collect()).unwrap_or_default()
+}
+
+/// A crash leaves icloudpd running on its own. Two writers in one folder corrupt `.part` files, so stop it first.
+/// It cannot be re-attached (its output pipe died with the app); icloudpd skips what it already has when restarted.
+fn stop_strays(app: &AppState, directory: &str) {
+    for stray in find_icloudpd(&owned_groups(app), Some(directory)) {
+        terminate(stray.group, Duration::from_secs(8));
+    }
+}
+
 fn start_icloud(app: &AppState, id: &str, job: &JobRecord, flag: Arc<Flag>) -> Option<IcloudChild> {
+    stop_strays(app, &job.source);
     let binary = resolve_command(&app.store.icloudpd_command());
     let args = command_args(&job.source, &job.apple_id, job.watch_secs);
     let mut command = std::process::Command::new(&binary);
@@ -180,16 +214,12 @@ fn start_icloud(app: &AppState, id: &str, job: &JobRecord, flag: Arc<Flag>) -> O
     let pid = child.id();
     app.pids.lock().expect("pids").insert(id.to_string(), pid);
     if let Some(output) = child.stdout.take() {
-        let flag = flag.clone();
-        let store = app.store.clone();
-        let job_id = id.to_string();
-        std::thread::spawn(move || pump(output, flag, store, job_id));
+        let (flag, id) = (flag.clone(), id.to_string());
+        std::thread::spawn(move || pump(output, flag, &id));
     }
     if let Some(output) = child.stderr.take() {
-        let flag = flag.clone();
-        let store = app.store.clone();
-        let job_id = id.to_string();
-        std::thread::spawn(move || pump(output, flag, store, job_id));
+        let (flag, id) = (flag.clone(), id.to_string());
+        std::thread::spawn(move || pump(output, flag, &id));
     }
     let (sender, done) = mpsc::channel();
     let flag = flag.clone();
@@ -204,13 +234,21 @@ fn start_icloud(app: &AppState, id: &str, job: &JobRecord, flag: Arc<Flag>) -> O
     Some(IcloudChild { pid, done })
 }
 
-fn pump(reader: impl std::io::Read, flag: Arc<Flag>, store: Arc<Store>, id: String) {
+fn pump(reader: impl std::io::Read, flag: Arc<Flag>, id: &str) {
+    let path = log_path(id);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).ok();
     for line in BufReader::new(reader).lines() {
         let Ok(line) = line else {
             break;
         };
-        if line.contains("Downloading ") && line.contains(" to ") {
-            let _ = store.set_error(&id, None);
+        // DEBUG is one noisy line per HTTP request; it would grow the file by hundreds of MB on a big library.
+        if !line.contains(" DEBUG ") {
+            if let Some(file) = file.as_mut() {
+                let _ = writeln!(file, "{line}");
+            }
         }
         flag.observe_icloud_line(&line);
     }
@@ -223,8 +261,8 @@ fn interrupt(pid: u32) {
 fn stop_children(state: &AppState) {
     if let Ok(flags) = state.flags.lock() {
         for flag in flags.values() {
+            // Not request_stop: that would save the job as "stopped" and it would not resume on the next launch.
             flag.mark_stopping();
-            flag.request_stop();
         }
     }
     if let Ok(pids) = state.pids.lock() {
@@ -271,7 +309,8 @@ fn list_jobs(state: State<'_, Arc<AppState>>) -> Result<Vec<JobListItem>, String
             } else {
                 None
             };
-            Ok(JobListItem { job, done, total, arranged, icloud_status })
+            let failed = state.store.errors(&job.id).map_err(|err| err.to_string())?.len();
+            Ok(JobListItem { job, done, total, arranged, failed, icloud_status })
         })
         .collect()
 }
@@ -311,7 +350,8 @@ fn create_job(
             source,
             dest,
             recursive: if icloud { true } else { recursive },
-            modified_since: modified_since.filter(|day| !day.is_empty()),
+            // icloudpd stamps files with the photo's date, so a date filter would silently skip old photos.
+            modified_since: modified_since.filter(|day| !day.is_empty() && !icloud),
             skip_junk,
             sort_into_months,
             review_duplicates,
@@ -373,6 +413,18 @@ fn signal(state: &AppState, id: &str, stop: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn delete_job(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    if let Some(job) = state.store.get_job(&id).map_err(|err| err.to_string())? {
+        if job.state == "running" || job.state == "needs_review" {
+            return Err("Pause or stop this sync before deleting it.".into());
+        }
+    }
+    state.store.delete_job(&id).map_err(|err| err.to_string())?;
+    let _ = fs::remove_file(log_path(&id));
+    Ok(())
+}
+
+#[tauri::command]
 fn resume_job(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     ensure_idle(&state, Some(&id))?;
     let job = state.store.get_job(&id).map_err(|err| err.to_string())?.ok_or_else(|| "job not found".to_string())?;
@@ -401,13 +453,14 @@ fn confirm_review(state: State<'_, Arc<AppState>>, id: String, confirm: bool) ->
 fn get_settings(state: State<'_, Arc<AppState>>) -> SettingsView {
     SettingsView {
         login: state.store.start_at_login(),
+        restart_on_crash: state.store.restart_on_crash(),
         workers: state.store.worker_count(),
         icloudpd: state.store.icloudpd_command(),
     }
 }
 
 #[tauri::command]
-fn set_settings(state: State<'_, Arc<AppState>>, login: bool, workers: u32, icloudpd: String) -> Result<(), String> {
+fn set_settings(state: State<'_, Arc<AppState>>, login: bool, restart_on_crash: bool, workers: u32, icloudpd: String) -> Result<(), String> {
     let workers = workers.clamp(1, 20);
     let command = icloudpd.trim();
     if command.is_empty() {
@@ -416,8 +469,76 @@ fn set_settings(state: State<'_, Arc<AppState>>, login: bool, workers: u32, iclo
     state.store.set_setting("login", if login { "true" } else { "false" }).map_err(|err| err.to_string())?;
     state.store.set_setting("workers", &workers.to_string()).map_err(|err| err.to_string())?;
     state.store.set_setting("icloudpd", command).map_err(|err| err.to_string())?;
-    apply_login(login);
+    state.store.set_setting("restart_on_crash", if restart_on_crash { "true" } else { "false" }).map_err(|err| err.to_string())?;
+    apply_login(login, restart_on_crash);
     Ok(())
+}
+
+#[tauri::command]
+async fn check_backup_cmd(state: State<'_, Arc<AppState>>, id: String) -> Result<sync_icloud_engine::BackupCheck, String> {
+    let job = state.store.get_job(&id).map_err(|err| err.to_string())?.ok_or_else(|| "job not found".to_string())?;
+    // Async so the directory walk runs off the UI thread.
+    check_backup(Path::new(&job.source), Path::new(&job.dest), job.sort_into_months).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn app_status(state: State<'_, Arc<AppState>>) -> Option<Recovery> {
+    state.recovery.lock().ok().and_then(|recovery| recovery.clone())
+}
+
+#[tauri::command]
+fn dismiss_recovery(state: State<'_, Arc<AppState>>) {
+    if let Ok(mut recovery) = state.recovery.lock() {
+        *recovery = None;
+    }
+}
+
+#[tauri::command]
+fn list_stray(state: State<'_, Arc<AppState>>) -> Vec<Stray> {
+    find_icloudpd(&owned_groups(&state), None)
+}
+
+#[tauri::command]
+fn stop_stray(state: State<'_, Arc<AppState>>) {
+    for stray in find_icloudpd(&owned_groups(&state), None) {
+        terminate(stray.group, Duration::from_secs(8));
+    }
+}
+
+/// After a crash: wait until the files already downloaded are copied, then compare names and folders.
+fn watch_recovery(state: Arc<AppState>, ids: Vec<String>) {
+    std::thread::spawn(move || {
+        let set = |phase: &str, missing: usize, wrong_folder: usize| {
+            if let Ok(mut recovery) = state.recovery.lock() {
+                *recovery = Some(Recovery { phase: phase.into(), missing, wrong_folder });
+            }
+        };
+        set("catching_up", 0, 0);
+        std::thread::sleep(Duration::from_secs(5)); // let the first scan queue the leftovers
+        let started = std::time::Instant::now();
+        let busy = |id: &String| {
+            let sort = state.store.get_job(id).ok().flatten().is_some_and(|job| job.sort_into_months);
+            state.store.has_open_work(id, sort).unwrap_or(true)
+        };
+        while ids.iter().any(busy) && started.elapsed() < Duration::from_secs(1800) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        for attempt in 0..2 {
+            let (mut missing, mut wrong) = (0, 0);
+            for job in ids.iter().filter_map(|id| state.store.get_job(id).ok().flatten()) {
+                if let Ok(check) = check_backup(Path::new(&job.source), Path::new(&job.dest), job.sort_into_months) {
+                    missing += check.missing.len();
+                    wrong += check.wrong_folder.len();
+                }
+            }
+            // A file that landed mid-check gets one more pass before we call it a problem.
+            if missing + wrong == 0 || attempt == 1 {
+                set(if missing + wrong == 0 { "ok" } else { "problem" }, missing, wrong);
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    });
 }
 
 #[tauri::command]
@@ -472,21 +593,40 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let store = Arc::new(Store::open(&db_path()).map_err(|err| err.to_string())?);
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(db_path().with_file_name("app.lock"))
+                .map_err(|err| err.to_string())?;
+            if lock.try_lock().is_err() {
+                std::process::exit(0); // another copy is already running
+            }
+            let _ = INSTANCE_LOCK.set(lock);
+            let crashed = store.setting("clean_exit").ok().flatten().as_deref() == Some("false");
+            let _ = store.set_setting("clean_exit", "false");
             let state = Arc::new(AppState {
                 store: store.clone(),
                 flags: Mutex::new(HashMap::new()),
                 gates: Mutex::new(HashMap::new()),
                 pids: Mutex::new(HashMap::new()),
+                recovery: Mutex::new(None),
             });
             app.manage(state.clone());
             recover_interrupted(&store).ok();
             if let Ok(ids) = store.running_job_ids() {
+                if crashed {
+                    let live: Vec<String> = ids.iter().filter(|id| store.get_job(id).ok().flatten().is_some_and(|job| job.icloud)).cloned().collect();
+                    if !live.is_empty() {
+                        watch_recovery(state.clone(), live);
+                    }
+                }
                 for id in ids {
                     spawn(state.clone(), id);
                 }
             }
             if store.start_at_login() {
-                apply_login(true);
+                apply_login(true, store.restart_on_crash());
             }
             let status = MenuItem::with_id(app, "status", "Idle", false, None::<&str>)?;
             let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
@@ -496,12 +636,15 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&status, &pause, &resume, &open, &quit])?;
             let handle = app.handle().clone();
             let tray = TrayIconBuilder::new()
+                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+                .icon_as_template(true)
                 .menu(&menu)
                 .tooltip("Sync iCloud Photos")
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     "quit" => {
                         if let Some(state) = app.try_state::<Arc<AppState>>() {
                             stop_children(state.inner());
+                            let _ = state.store.set_setting("clean_exit", "true");
                         }
                         app.exit(0);
                     }
@@ -535,14 +678,39 @@ pub fn run() {
             pause_job,
             stop_job,
             resume_job,
+            delete_job,
             confirm_review,
             get_settings,
             set_settings,
             pick_folder,
-            open_signin
+            open_signin,
+            check_backup_cmd,
+            app_status,
+            dismiss_recovery,
+            list_stray,
+            stop_stray
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Sync iCloud Photos");
+        .build(tauri::generate_context!())
+        .expect("failed to build Sync iCloud Photos")
+        .run(|app, event| {
+            // Cmd+Q and the tray's Quit both end here; only the tray path used to mark the exit clean.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                    stop_children(state.inner());
+                    let _ = state.store.set_setting("clean_exit", "true");
+                }
+            }
+            // Dock-icon click while the window is hidden in the tray.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 fn watch_tray(state: Arc<AppState>, status: tauri::menu::MenuItem<tauri::Wry>, tray: tauri::tray::TrayIcon) {

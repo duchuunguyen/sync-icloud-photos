@@ -2,6 +2,8 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use md5::Digest;
+
 use crate::hash::md5_file;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,7 +46,8 @@ pub fn copy_reporting(
     should_abort: &dyn Fn() -> bool,
     on_progress: &dyn Fn(u64, u64),
 ) -> Result<CopyAction, CopyError> {
-    if dest.is_file() && md5_file(src)? == md5_file(dest)? {
+    let same_size = fs::metadata(dest).is_ok_and(|d| d.is_file() && fs::metadata(src).is_ok_and(|s| s.len() == d.len()));
+    if same_size && md5_file(src)? == md5_file(dest)? {
         return Ok(CopyAction::SkippedIdentical);
     }
     if let Some(parent) = dest.parent() {
@@ -55,8 +58,8 @@ pub fn copy_reporting(
         if should_abort() {
             return Err(CopyError::Aborted);
         }
-        write_temp(src, &temp, should_abort, on_progress)?;
-        if md5_file(src)? != md5_file(&temp)? {
+        let source_md5 = write_temp(src, &temp, should_abort, on_progress)?;
+        if source_md5 != md5_file(&temp)? {
             return Err(CopyError::HashMismatch);
         }
         fs::rename(&temp, dest)?;
@@ -73,8 +76,9 @@ fn write_temp(
     temp: &Path,
     should_abort: &dyn Fn() -> bool,
     on_progress: &dyn Fn(u64, u64),
-) -> Result<(), CopyError> {
+) -> Result<String, CopyError> {
     let total = fs::metadata(src)?.len();
+    let mut hasher = md5::Md5::new();
     let mut input = File::open(src)?;
     let mut output = File::create(temp)?;
     let mut buf = [0u8; 64 * 1024];
@@ -88,12 +92,15 @@ fn write_temp(
         if n == 0 {
             break;
         }
+        hasher.update(&buf[..n]);
         output.write_all(&buf[..n])?;
         done += n as u64;
         on_progress(done, total);
     }
+    // The filing date falls back to modified time, so the copy must keep the source's.
+    output.set_modified(fs::metadata(src)?.modified()?)?;
     output.sync_all()?;
-    Ok(())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]

@@ -68,15 +68,47 @@ fn parse_exif_date(value: &str) -> Option<NaiveDate> {
 /// The folder month uses that UTC date so it does not change with the machine timezone.
 fn read_quicktime_creation(path: &Path) -> Option<NaiveDate> {
     let mut file = File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    let seconds = find_mvhd_creation(&bytes)?;
+    let moov = read_moov(&mut file)?;
+    let seconds = find_mvhd_creation(&moov)?;
     if seconds == 0 {
         return None;
     }
     let base = NaiveDate::from_ymd_opt(1904, 1, 1)?.and_hms_opt(0, 0, 0)?;
     let stamp = base.checked_add_signed(TimeDelta::seconds(seconds as i64))?;
     Some(stamp.date())
+}
+
+/// Walk the top-level boxes by seeking, so a multi-GB video is never read whole. Returns the `moov` box
+/// (header included) in the form `find_mvhd_creation` expects.
+fn read_moov(file: &mut File) -> Option<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    let len = file.metadata().ok()?.len();
+    let mut offset = 0u64;
+    while offset + 8 <= len {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut head = [0u8; 8];
+        file.read_exact(&mut head).ok()?;
+        let mut size = u32::from_be_bytes(head[..4].try_into().ok()?) as u64;
+        if size == 1 {
+            let mut wide = [0u8; 8];
+            file.read_exact(&mut wide).ok()?;
+            size = u64::from_be_bytes(wide);
+        } else if size == 0 {
+            size = len - offset;
+        }
+        if size < 8 || offset + size > len {
+            return None;
+        }
+        if &head[4..8] == b"moov" {
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            let mut bytes = vec![0u8; usize::try_from(size).ok()?];
+            file.read_exact(&mut bytes).ok()?;
+            // ponytail: a 64-bit moov header makes the walker give up (falls back to modified time); rare.
+            return Some(bytes);
+        }
+        offset += size;
+    }
+    None
 }
 
 fn find_mvhd_creation(bytes: &[u8]) -> Option<u32> {
