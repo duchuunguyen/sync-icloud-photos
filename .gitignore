@@ -36,3 +36,10 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### Desktop app ###
+desktop/target/
+desktop/ui/dist/
+desktop/ui/node_modules/
+desktop/node_modules/
+desktop/src-tauri/gen/

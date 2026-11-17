@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sync iCloud Photos — design mockup</title>
+<style>
+  :root {
+    --bg: #e6e2da;
+    --ink: #1c1c1e;
+    --muted: #6d6d72;
+    --line: #d8d8dc;
+    --sidebar: #efeff1;
+    --paper: #ffffff;
+    --blue: #0a66c2;
+    --blue-press: #084f96;
+    --soft: #f4f4f6;
+    --danger: #b42318;
+    --ok: #1b7f3a;
+    --warn: #8a5a00;
+    --shadow: 0 18px 50px rgba(40, 32, 20, 0.18);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    min-height: 100%;
+  }
+  button, input { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  .desk {
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 24px 40px;
+  }
+  .menubar {
+    width: 100%;
+    height: 28px;
+    background: rgba(255,255,255,0.72);
+    border-bottom: 1px solid rgba(0,0,0,0.08);
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    gap: 16px;
+    font-size: 13px;
+    position: relative;
+  }
+  .menubar b { font-weight: 650; }
+  .menubar .spacer { flex: 1; }
+  .tray-btn {
+    border: 0;
+    background: transparent;
+    padding: 2px 8px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .tray-btn:hover, .tray-btn.open { background: rgba(0,0,0,0.06); }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--blue);
+    box-shadow: 0 0 0 3px rgba(10,102,194,0.15);
+  }
+  .tray-menu {
+    display: none;
+    position: absolute;
+    top: 30px;
+    right: 12px;
+    width: 260px;
+    background: rgba(250,250,252,0.96);
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 10px;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.16);
+    padding: 6px;
+    z-index: 5;
+    text-align: left;
+  }
+  .tray-menu.show { display: block; }
+  .tray-menu .status {
+    padding: 8px 10px 10px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 4px;
+  }
+  .tray-menu .status small { color: var(--muted); display: block; margin-top: 2px; }
+  .tray-menu button {
+    width: 100%;
+    text-align: left;
+    border: 0;
+    background: transparent;
+    border-radius: 6px;
+    padding: 7px 10px;
+  }
+  .tray-menu button:hover { background: var(--blue); color: white; }
+  .switcher {
+    width: min(980px, 100%);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 18px 0 12px;
+    align-items: center;
+  }
+  .switcher span { font-size: 12px; color: #5c574e; margin-right: 4px; }
+  .switcher button {
+    border: 1px solid rgba(0,0,0,0.08);
+    background: rgba(255,255,255,0.55);
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .switcher button.on { background: var(--ink); color: white; border-color: var(--ink); }
+  .window {
+    width: min(980px, 100%);
+    height: 640px;
+    background: var(--paper);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid rgba(255,255,255,0.7);
+  }
+  .titlebar {
+    height: 48px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--line);
+    background: #fafafa;
+  }
+  .lights { display: flex; gap: 6px; margin-right: 8px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .lights i:nth-child(1) { background: #ff5f57; }
+  .lights i:nth-child(2) { background: #febc2e; }
+  .lights i:nth-child(3) { background: #28c840; }
+  .titlebar strong { font-size: 13px; font-weight: 650; }
+  .body { flex: 1; display: flex; min-height: 0; }
+  .side {
+    width: 196px;
+    background: var(--sidebar);
+    border-right: 1px solid var(--line);
+    padding: 14px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .side button {
+    text-align: left;
+    border: 0;
+    background: transparent;
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: var(--ink);
+  }
+  .side button.on { background: white; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+  .side .hint { margin-top: auto; font-size: 11px; color: var(--muted); padding: 8px; line-height: 1.4; }
+  main { flex: 1; overflow: auto; padding: 22px 26px 28px; }
+  h1 { font-size: 22px; font-weight: 650; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 18px; font-size: 13px; line-height: 1.45; }
+  .row-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .primary, .ghost, .quiet {
+    border-radius: 8px;
+    padding: 7px 12px;
+    border: 1px solid transparent;
+  }
+  .primary { background: var(--blue); color: white; }
+  .primary:hover { background: var(--blue-press); }
+  .primary:disabled { background: #b9c7d6; cursor: default; }
+  .ghost { background: white; border-color: var(--line); }
+  .quiet { background: transparent; color: var(--danger); }
+  .job {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 4px 16px;
+    width: 100%;
+    text-align: left;
+    border: 1px solid var(--line);
+    background: white;
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+  }
+  .job:hover { border-color: #c5c5ca; }
+  .job b { font-weight: 620; }
+  .job small { color: var(--muted); }
+  .pill {
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: #e8f1fb;
+    color: var(--blue);
+    align-self: center;
+  }
+  .pill.done { background: #e7f6ec; color: var(--ok); }
+  .pill.wait { background: #fff4d6; color: var(--warn); }
+  label.field { display: block; margin-bottom: 12px; }
+  label.field span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .picker { display: flex; gap: 8px; }
+  .picker input {
+    flex: 1;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: var(--soft);
+  }
+  .checks { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 16px; }
+  .checks label { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; }
+  .checks small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .note {
+    background: #fff8e8;
+    border: 1px solid #f0e0b0;
+    color: #6b4e00;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    margin: -4px 0 12px 24px;
+  }
+  .stage { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .progress {
+    height: 6px;
+    background: #ececf0;
+    border-radius: 99px;
+    overflow: hidden;
+    margin: 10px 0;
+  }
+  .progress > div { height: 100%; background: var(--blue); width: 18%; }
+  .progress.arrange > div { background: var(--ok); width: 80%; }
+  .track { margin: 0 0 22px; }
+  .track-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .track-head b { font-size: 14px; }
+  .track-head span, .track .detail, .file-now { color: var(--muted); font-size: 12px; }
+  .track .detail { margin: 6px 0 0; }
+  .file-now { margin: 8px 0 0; }
+  .meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .current {
+    margin-top: 18px;
+    padding: 12px 14px;
+    background: var(--soft);
+    border-radius: 10px;
+  }
+  .current b { display: block; margin-bottom: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); font-weight: 600; padding: 0 8px 8px; }
+  td { padding: 10px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+  .keep { color: var(--ok); }
+  .drop { color: var(--danger); }
+  .footer-actions { display: flex; gap: 8px; margin-top: 16px; }
+  .hidden { display: none; }
+  .setting {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 0;
+    border-top: 1px solid var(--line);
+    align-items: center;
+  }
+  .setting p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+  .toggle {
+    width: 40px; height: 24px; border-radius: 99px; border: 0;
+    background: #e1e1e6; position: relative; flex: none;
+  }
+  .toggle.on { background: #34c759; }
+  .toggle i {
+    position: absolute; top: 2px; left: 2px;
+    width: 20px; height: 20px; border-radius: 50%; background: white;
+    transition: left 0.15s ease;
+  }
+  .toggle.on i { left: 18px; }
+  input[type="number"] {
+    width: 72px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 8px;
+  }
+</style>
+</head>
+<body>
+<div class="desk">
+  <div class="menubar">
+    <b>Sync iCloud Photos</b>
+    <span>File</span>
+    <span>Edit</span>
+    <span class="spacer"></span>
+    <button class="tray-btn" id="trayBtn" type="button">
+      <span class="dot"></span>
+      Copying 1,420 / 8,000
+    </button>
+    <div class="tray-menu" id="trayMenu">
+      <div class="status">
+        <b>Copying</b>
+        <small>iCloud Photos → arranged-photos</small>
+        <small>Syncing 1,420 of 8,000 · Arranged 1,100 of 1,380</small>
+      </div>
+      <button type="button" data-go="job">Pause</button>
+      <button type="button" data-go="job">Open</button>
+      <button type="button">Quit</button>
+    </div>
+  </div>
+
+  <div class="switcher">
+    <span>Mockup screens</span>
+    <button type="button" data-go="home" class="on">Home</button>
+    <button type="button" data-go="new">New sync</button>
+    <button type="button" data-go="job">Copying</button>
+    <button type="button" data-go="duplicates">Duplicate review</button>
+    <button type="button" data-go="removal">Removal review</button>
+    <button type="button" data-go="settings">Settings</button>
+  </div>
+
+  <div class="window">
+    <div class="titlebar">
+      <div class="lights" aria-hidden="true"><i></i><i></i><i></i></div>
+      <strong>Sync iCloud Photos</strong>
+    </div>
+    <div class="body">
+      <nav class="side">
+        <button type="button" data-go="home" class="on" id="navJobs">Jobs</button>
+        <button type="button" data-go="settings" id="navSettings">Settings</button>
+        <div class="hint">Closing this window keeps a running sync in the menu bar.</div>
+      </nav>
+      <main>
+        <section id="home">
+          <div class="row-actions">
+            <div>
+              <h1>Jobs</h1>
+              <p class="sub">Each job copies one folder, then waits if you asked to review deletions.</p>
+            </div>
+            <button class="primary" type="button" data-go="new">New sync</button>
+          </div>
+          <button class="job" type="button" data-go="job">
+            <b>iCloud Photos → arranged-photos</b>
+            <span class="pill">Copying</span>
+            <small>/Users/duchuunguyen/Pictures/iCloud Photos</small>
+            <small>1,420 / 8,000</small>
+          </button>
+          <button class="job" type="button" data-go="duplicates">
+            <b>Camera Roll → archive</b>
+            <span class="pill wait">Review duplicates</span>
+            <small>/Users/duchuunguyen/Pictures/Camera Roll</small>
+            <small>2 groups waiting</small>
+          </button>
+        </section>
+
+        <section id="new" class="hidden">
+          <h1>New sync</h1>
+          <p class="sub">The copy uses the same MD5 rule as the Java sync. The extra steps stay off unless you turn them on.</p>
+          <label class="field">
+            <span>Source</span>
+            <div class="picker">
+              <input readonly value="/Users/duchuunguyen/Pictures/iCloud Photos">
+              <button class="ghost" type="button">Choose</button>
+            </div>
+          </label>
+          <label class="field">
+            <span>Destination</span>
+            <div class="picker">
+              <input readonly value="/Users/duchuunguyen/Pictures/arranged-photos">
+              <button class="ghost" type="button">Choose</button>
+            </div>
+          </label>
+          <div class="checks">
+            <label><input type="checkbox" id="subfolders"> Include subfolders<small>Off matches today’s sync: only the files sitting directly in the source.</small></label>
+            <label><input type="checkbox" id="since"> Only files modified on or after <input type="date" style="margin-left:6px" disabled id="sinceDate"><small>Leave this off to copy every file in the snapshot.</small></label>
+            <label><input type="checkbox" checked> Skip .DS_Store and AppleDouble (._*) files</label>
+            <label><input type="checkbox" id="sort"> Sort into YYYY-MM folders<small>Uses the capture date. Falls back to the file’s modified time. No “webp” folder.</small></label>
+            <label><input type="checkbox"> Review duplicates when the copy finishes</label>
+            <label><input type="checkbox" id="removal"> Remove destination files that are no longer in the source<small>Always shows a list first. Never deletes on the first run.</small></label>
+          </div>
+          <div class="note hidden" id="sortNote">Sorting builds an archive, not a mirror of iCloud, so removal stays off for this job.</div>
+          <button class="primary" type="button" data-go="job">Start</button>
+        </section>
+
+        <section id="job" class="hidden">
+          <p class="stage">Syncing · can keep running with this window closed</p>
+          <h1>iCloud Photos → arranged-photos</h1>
+          <section class="track">
+            <div class="track-head"><b>Syncing</b><span>1,420 of 8,000 items</span></div>
+            <div class="progress" aria-hidden="true"><div></div></div>
+            <div class="meta"><span>18%</span><span>about 6 h left</span></div>
+            <p class="detail">Already on this Mac 900. Saved this pass 520.</p>
+          </section>
+          <section class="track">
+            <div class="track-head"><b>Arranging</b><span>1,100 of 1,380 files</span></div>
+            <div class="progress arrange" aria-hidden="true"><div></div></div>
+            <div class="meta"><span>80%</span><span>More files appear as they finish downloading</span></div>
+            <p class="file-now">IMG_2037.MOV · 640 MB / 1.2 GB</p>
+          </section>
+          <div class="footer-actions">
+            <button class="ghost" type="button">Pause</button>
+            <button class="quiet" type="button">Stop</button>
+          </div>
+        </section>
+
+        <section id="duplicates" class="hidden">
+          <h1>Review duplicates</h1>
+          <p class="sub">Same folder, same normalized name, same MD5. Nothing is deleted until you confirm.</p>
+          <table>
+            <thead><tr><th>Keep</th><th>Remove</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="keep">2024-06/IMG_0381.jpg</td>
+                <td class="drop">2024-06/IMG_0381(1).jpg</td>
+              </tr>
+              <tr>
+                <td class="keep">2023-11/VID.mov</td>
+                <td class="drop">2023-11/VID(1).mov<br>2023-11/VID (2).mov</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="footer-actions">
+            <button class="primary" type="button">Delete these copies</button>
+            <button class="ghost" type="button">Skip</button>
+          </div>
+        </section>
+
+        <section id="removal" class="hidden">
+          <h1>Remove files no longer in the source</h1>
+          <p class="sub">These were copied by an earlier run and are missing from the new snapshot. Files you added yourself are not listed.</p>
+          <table>
+            <thead><tr><th>Destination file</th><th>Last copied</th></tr></thead>
+            <tbody>
+              <tr><td>IMG_0179.mov</td><td>12 Oct 2025</td></tr>
+              <tr><td>IMG_3529.MOV</td><td>2 Feb 2024</td></tr>
+            </tbody>
+          </table>
+          <div class="footer-actions">
+            <button class="primary" type="button">Delete these files</button>
+            <button class="ghost" type="button">Skip</button>
+          </div>
+        </section>
+
+        <section id="settings" class="hidden">
+          <h1>Settings</h1>
+          <p class="sub">This Mac only. A Windows build would use a startup app instead of a login item.</p>
+          <div class="setting">
+            <div>
+              <b>Start at login</b>
+              <p>After a restart, a job that was running continues. A paused or stopped job stays that way.</p>
+            </div>
+            <button class="toggle on" type="button" id="loginToggle" aria-label="Start at login"><i></i></button>
+          </div>
+          <div class="setting">
+            <div>
+              <b>Parallel copies</b>
+              <p>The Java sync uses 20. One slow iCloud download occupies a single slot.</p>
+            </div>
+            <input type="number" value="20" min="1" max="20">
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+</div>
+<script>
+  const sections = ["home", "new", "job", "duplicates", "removal", "settings"];
+  function show(id) {
+    for (const name of sections) {
+      document.getElementById(name).classList.toggle("hidden", name !== id);
+    }
+    document.querySelectorAll(".switcher [data-go], .side [data-go]").forEach((btn) => {
+      btn.classList.toggle("on", btn.dataset.go === id || (id !== "settings" && btn.dataset.go === "home" && btn.id === "navJobs"));
+    });
+    document.getElementById("navJobs").classList.toggle("on", id !== "settings");
+    document.getElementById("navSettings").classList.toggle("on", id === "settings");
+    document.getElementById("trayMenu").classList.remove("show");
+    document.getElementById("trayBtn").classList.remove("open");
+  }
+  document.body.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-go]");
+    if (btn) show(btn.dataset.go);
+  });
+  document.getElementById("trayBtn").addEventListener("click", (event) => {
+    event.stopPropagation();
+    document.getElementById("trayMenu").classList.toggle("show");
+    document.getElementById("trayBtn").classList.toggle("open");
+  });
+  document.getElementById("sort").addEventListener("change", (event) => {
+    const on = event.target.checked;
+    const removal = document.getElementById("removal");
+    document.getElementById("sortNote").classList.toggle("hidden", !on);
+    removal.disabled = on;
+    if (on) removal.checked = false;
+  });
+  document.getElementById("since").addEventListener("change", (event) => {
+    document.getElementById("sinceDate").disabled = !event.target.checked;
+  });
+  document.getElementById("loginToggle").addEventListener("click", (event) => {
+    event.currentTarget.classList.toggle("on");
+  });
+</script>
+</body>
+</html>
